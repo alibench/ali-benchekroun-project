@@ -44,7 +44,7 @@ What I like about it:
 - 1 024-dim output — enough quality, not enough to bloat the vector store.
 - Produces dense **and** sparse vectors simultaneously. **I will only use the dense side today**, but storing the sparse vectors at ingestion keeps the door open to hybrid search in §2 without re-indexing later.
 
-I rejected **OpenAI** `text-embedding-3-large` despite its strong benchmarks because it is a proprietary API: every chunk would leave Switzerland. The only way to keep it Swiss-resident would be Azure OpenAI Switzerland North, which adds cost, vendor lock-in, and a new contractual layer for a marginal accuracy gain I think we don't necessarily need. I rejected `**multilingual-e5-large`** because its 512-token context is tight once the title prefix is added, and it has no sparse output. I rejected `**jina-embeddings-v3**` because its current CC-BY-NC license is ambiguous for commercial internal use.
+I rejected **OpenAI** `text-embedding-3-large` despite its strong benchmarks because it is a proprietary API: every chunk would leave Switzerland. The only way to keep it Swiss-resident would be Azure OpenAI Switzerland North, which adds cost, vendor lock-in, and a new contractual layer for a marginal accuracy gain I think we don't necessarily need. I rejected `**multilingual-e5-large`** because its 512-token context is tight once the title prefix is added, and it has no sparse output. I rejected `**jina-embeddings-v3`** because its current CC-BY-NC license is ambiguous for commercial internal use.
 
 I serve the model with **Text Embeddings Inference (TEI)** from Hugging Face, in a container on the same Swiss VM as the rest of the stack. It gives me batching and a stable HTTP endpoint without me writing a server from scratch.
 
@@ -56,7 +56,7 @@ Every chunk stored in the vector database carries metadata I need for three jobs
 
 For **citation**, I keep the source filename, document version, and the heading path of the section the chunk came from. When the LLM answers, it quotes those fields so employees can verify the claim against the original document, which is in my point of view non-negotiable for an internal tool.
 
-For **access control**, each chunk inherits the access tags of its source folder in the document management system, plus a confidentiality level (internal / confidential / restricted). The vector store applies these as a **pre-filter** before similarity search, so a user never retrieves a chunk they are not authorised to see. Details in §5; the point here is that these fields must be set at ingestion, not later, so the cosine-similarity does not run more for nothing (it won't be efficient, and a lot of people make this mistake).
+For **access control**, each chunk inherits the access tags of its source folder in the document management system, plus a confidentiality level (internal / confidential / restricted). The vector store applies these as a **pre-filter** before similarity search, so a user never retrieves a chunk they are not authorised to see. Details in §5; the point here is that these fields must be set at ingestion, not later, so the cosine-similarity does not run more for nothing (it won't be efficient, and a lot of people make this mistake, here's an extreme example: if only 2 % of chunks are accessible to a user, we might retrieve 100 candidates and be left with 0 matching the filter).
 
 For **re-indexing and compliance**, I store the file's SHA-256 hash, the last-modified and last-ingested timestamps, the chunk's index and total count within its document, and the name of the embedding model that produced the vector. The hash lets me detect changes cheaply; the timestamps let me prove freshness; the chunk indices let me pull neighbouring chunks if the LLM needs more context; the embedding-model field lets me migrate safely.
 
@@ -89,3 +89,37 @@ For each file in the Swiss document source (SharePoint / Nextcloud / shared fold
 Log the run (file counts, timings, errors) to the audit log (Swiss soil).
 ```
 
+## 2. Vector Store
+
+### 2.1 What I need from the vector store
+
+For this use case I have five criteria, in roughly this order of importance: (1) self-hostable on a Swiss VM, because nFADP rules out any managed cloud outside Switzerland; (2) permissive commercial license — Apache 2.0 or equivalent — so the SME is not forced into re-licensing conversations later; (3) strong metadata pre-filtering, because RBAC (§5) depends on filtering *before* the similarity search, not after; (4) native hybrid-search support so I can enable dense + sparse retrieval later without re-indexing; (5) low operational burden — one container, one volume, one port — because the SME's IT team is small.
+
+### 2.2 My choice: Qdrant, self-hosted, single-node
+
+I would use **Qdrant**, running as a single Docker container on a Swiss VM (§4), with a persistent volume for vector data and periodic snapshots for backup.
+
+Qdrant fits all six criteria without compromise. It is Apache 2.0, written in Rust (so it runs in a single binary and is memory-efficient), and its metadata filtering uses an implementation they call "filterable HNSW" that integrates the filter directly into the graph walk. That matters to me because my RBAC filters are often selective, a given user may only be entitled to a small fraction of the corpus, and in that regime a post-filter approach returns too few matches. Hybrid search (dense + sparse + RRF) is native and behind a single configuration switch, which is exactly the upgrade path I want.
+
+I considered four alternatives and rejected them:
+
+- **Milvus** is engineered for billion-vector workloads with a distributed, multi-component architecture. Over-engineered for my scale (roughly 10⁵–10⁶ chunks).
+- **Weaviate** is a strong option with good filters and native hybrid, but operationally heavier than Qdrant (more configuration, more moving parts). I didn't find any quality gain to justify the extra surface area for a SME team.
+- **Chroma** is very light to run, but its filter implementation degrades on selective queries and hybrid support is limited. Good for prototypes, not where I'd bet production RBAC.
+- **pgvector** (PostgreSQL extension) is genuinely tempting if the SME already runs Postgres: vector search becomes "just another column," and backups, replication, and access control are inherited from a system the IT team already knows. I rejected it here because hybrid search has to be hand-wired (Postgres full-text search + vector column, fused in the application), its HNSW is less tuned than Qdrant's, and filter quality relies on the Postgres query planner. If I later discovered the SME already had a Postgres DBA and a lightweight corpus, I would revisit this decision.
+
+### 2.3 Index and search configuration
+
+I'd configure Qdrant with an **HNSW index** (graph-based approximate nearest-neighbour search) using **cosine similarity** as the metric, consistent with how BGE-M3 was trained. HNSW is the default in Qdrant and trades around one percent of recall for a 10–100× speedup over brute-force search — a very acceptable loss.
+
+Every query carries a **metadata pre-filter** on `access_tags` and, when relevant, `language`. Pre-filtering (as opposed to post-filtering) is non-negotiable here: if a user is only entitled to 5 % of the corpus, a post-filter retrieves the global top-k first and may leave us with zero accessible matches. Qdrant's filterable-HNSW walks the graph only through vectors that already satisfy the filter, which keeps both recall and latency stable regardless of how selective the filter is.
+
+For day-one sizing, a single Qdrant instance with a few GB of RAM handles the SME's expected corpus (~10⁵–10⁶ chunks × 1 024-dim vectors ≈ a few GB of vectors + index) with sub-100 ms query latency. Snapshots are scheduled nightly to the same Swiss storage used for the rest of the stack (§4), which also keeps the disaster-recovery story aligned with nFADP retention rules.
+
+### 2.4 Hybrid search: why dense-only at v1, and how I kept hybrid ready
+
+Dense embeddings alone struggle on rare tokens — form codes, acronyms, policy IDs, proper names — because those strings carry little semantic content and the embedder averages them out. Hybrid search fixes this by running dense retrieval in parallel with a sparse/keyword retrieval (BM25-style) and fusing the two rankings into a single ranked list, typically with **Reciprocal Rank Fusion (RRF)** because it is scale-free and needs no tuning.
+
+I still chose **dense-only for v1**. The corpus is prose — HR policies, procedures, security documents — where paraphrases and synonyms dominate (which is the regime where dense shines). Shipping hybrid on day one would mean tuning a fusion weight against queries I haven't seen yet, which is guesswork. Starting dense-only lets the query logs tell me whether hybrid would actually help before I add the complexity.
+
+What makes this safe rather than lazy is that I already picked BGE-M3, which emits a sparse vector alongside the dense one in the same forward pass (§1.3), and I picked Qdrant, which supports hybrid dense + sparse + RRF natively. Enabling hybrid later is just a configuration change, not a re-indexing.
