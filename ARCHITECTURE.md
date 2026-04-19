@@ -1,4 +1,4 @@
-# ARCHITECTURE.md
+# [ARCHITECTURE.md](http://ARCHITECTURE.md)
 
 ## Context
 
@@ -163,3 +163,37 @@ The cheapest and highest-leverage defence I'd use is a **strict grounded system 
 On top of that, I would add a **cross-encoder reranker** (like `BAAI/bge-reranker-v2-m3`) on the top-k candidates returned by Qdrant. A cross-encoder scores `(query, chunk)` pairs jointly rather than through cosine similarity of independent embeddings, so it is materially more accurate on borderline cases. I'd set a minimum score threshold below which the orchestrator abstains and tells the user the policies don't cover the question — an explicit "no answer" is far safer in an HR context than a confidently wrong one.
 
 Finally, I'd run a **post-generation citation check**: before sending the answer back, the orchestrator verifies that every cited chunk ID was actually in the retrieved context and that the cited text substring appears in that chunk. If the check fails, the answer is rejected and either regenerated once or replaced by an abstain. This closes the loop on the one hallucination pattern the prompt alone cannot stop — the model inventing a plausible-looking citation.
+
+## 7. Pipeline diagram
+
+There are **two** straight-line flows: indexing documents (batch), then answering a question (online). Details stay in §§1–6; the drawings are only the skeleton.
+
+**A — Ingestion:** files are read, turned into chunks, embedded, stored.
+
+```mermaid
+flowchart LR
+  A[Documents] --> B[Parse and chunk]
+  B --> C[Embed]
+  C --> D[(Qdrant)]
+```
+
+
+
+**B — Query (for each question):** same embedder as ingestion, search the index, then generate an answer. Login (IdP) tells the app which chunks the user may see.
+
+```mermaid
+flowchart LR
+  U[User] --> G[App]
+  I[IdP] -.->|who can see what| G
+  G --> E[Embed query]
+  E --> S[Search Qdrant]
+  S --> R[Rerank]
+  R --> L[LLM]
+  L --> O[Answer]
+```
+
+
+
+**C — Where it runs:** TEI, Qdrant, LLM (vLLM), app, Postgres ledger/audit, Caddy — all on **Swiss VMs** (§4). No separate drawing; one place, one jurisdiction.
+
+**D — Reducing bad answers (§6):** grounded system prompt → reranker with an abstain threshold → check citations before returning text.
